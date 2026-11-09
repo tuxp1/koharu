@@ -8,7 +8,7 @@
     "postinstall": "cargo install tauri-cli --git https://github.com/tauri-apps/tauri --rev 78f49ba3993fed5a1b921235c547731006ad2a74 --locked",
     "predev": "kill-port 3000",
     "dev": "cargo tauri dev",
-    "build": "cargo tauri build --no-bundle",
+    "build": "cargo build --release --bin koharu-cli -p koharu-pipeline",
     "docs": "bun run --filter @koharu/docs dev",
     "lint": "bun run --filter '@koharu/*' lint",
     "test": "bun run --filter @koharu/app test",
