@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,12 +20,12 @@ use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft, Session}
 use koharu_translator::{GenerationConfig, Language, ModelSelection, Provider, ProvidersConfig};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Run Koharu's complete in-process pipeline")]
+#[command(version, about = "Run Koharu's complete in-process pipeline in batch/headless mode")]
 struct Arguments {
-    #[arg(short, long, value_name = "INPUT")]
+    #[arg(short, long, value_name = "INPUT", help = "Input image file or directory of images")]
     input: PathBuf,
 
-    #[arg(short, long, value_name = "OUTPUT")]
+    #[arg(short, long, value_name = "OUTPUT", help = "Output image file or directory")]
     output: PathBuf,
 
     #[arg(long, value_enum, default_value = "koharu-layout-rfdetr-seg-2xl")]
@@ -137,87 +137,128 @@ async fn main() -> Result<()> {
     let arguments = Arguments::parse();
     initialize_with_retry().await;
 
-    let source = fs::read(&arguments.input)
-        .with_context(|| format!("failed to read {}", arguments.input.display()))?;
-    let decoded = image::load_from_memory(&source).context("failed to decode input image")?;
-    let name = arguments
-        .input
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("input");
-    let mut session = Session::memory().await?;
-    let mut page = None;
-    let patch = session.snapshot().patch(|edit| {
-        let id = edit.add_page(
-            PageDraft::new(
-                name,
-                f64::from(decoded.width()),
-                f64::from(decoded.height()),
-            ),
-            At::End,
-        )?;
-        edit.set_asset(
-            id,
-            &AssetRole::new("source")?,
-            AssetInput::new(
-                Arc::<[u8]>::from(source),
-                image_media_type(&arguments.input),
-                AssetMetadata {
-                    width: Some(decoded.width()),
-                    height: Some(decoded.height()),
-                    attributes: BTreeMap::new(),
-                },
-            ),
-        )?;
-        page = Some(id);
-        Ok(())
-    })?;
-    session.commit(patch).await?;
-    let page = page.expect("page ID is assigned by the edit");
-
     let device = koharu_ml::device(arguments.cpu);
     let pipeline = Pipeline::from_config(
         Config::memory(arguments.pipeline_config()),
         Config::memory(ProvidersConfig::default()),
         device,
     )?;
-    let snapshot = session.snapshot();
-    let mut committer = SessionCommitter(&mut session);
-    let report = pipeline
-        .execute(
-            snapshot,
-            Request {
-                operation: Operation::Full,
-                scope: Scope::Pages(vec![page]),
-                progress: Some(Arc::new(|event| {
-                    if let Progress::Finished { stage, elapsed, .. } = event {
-                        eprintln!("{stage} finished in {:.2}s", elapsed.as_secs_f64());
-                    }
-                })),
-                ..Request::default()
-            },
-            &mut committer,
-        )
-        .await?;
-    eprintln!("pipeline finished in {:.2}s", report.elapsed.as_secs_f64());
-
     let renderer = Renderer::new()?;
-    let render_started = Instant::now();
-    let snapshot = session.snapshot();
-    let frame = renderer.render(&snapshot, page).await?;
     let rasterizer = Rasterizer::new()?;
-    let raster = rasterizer.rasterize(&frame.raster_frame()?, RasterOptions::default())?;
-    let render_elapsed = render_started.elapsed();
-    raster
-        .image
-        .save(&arguments.output)
-        .with_context(|| format!("failed to write {}", arguments.output.display()))?;
-    eprintln!(
-        "rendered {} in {:.2}s",
-        arguments.output.display(),
-        render_elapsed.as_secs_f64()
-    );
+
+    // Support both single file and directory batch processing
+    let tasks: Vec<(PathBuf, PathBuf)> = if arguments.input.is_dir() {
+        fs::create_dir_all(&arguments.output)
+            .with_context(|| format!("failed to create output directory {}", arguments.output.display()))?;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&arguments.input)
+            .with_context(|| format!("failed to read directory {}", arguments.input.display()))?
+        {
+            let path = entry?.path();
+            if is_image(&path) {
+                let file_name = path.file_name().unwrap();
+                let out_path = arguments.output.join(file_name);
+                entries.push((path, out_path));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    } else {
+        vec![(arguments.input.clone(), arguments.output.clone())]
+    };
+
+    let total = tasks.len();
+    eprintln!("Processing {} item(s) through Koharu pipeline...", total);
+
+    for (idx, (in_path, out_path)) in tasks.into_iter().enumerate() {
+        let file_start = Instant::now();
+        let source = fs::read(&in_path)
+            .with_context(|| format!("failed to read {}", in_path.display()))?;
+        let decoded = image::load_from_memory(&source).context("failed to decode input image")?;
+        let name = in_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("input");
+
+        let mut session = Session::memory().await?;
+        let mut page = None;
+        let patch = session.snapshot().patch(|edit| {
+            let id = edit.add_page(
+                PageDraft::new(
+                    name,
+                    f64::from(decoded.width()),
+                    f64::from(decoded.height()),
+                ),
+                At::End,
+            )?;
+            edit.set_asset(
+                id,
+                &AssetRole::new("source")?,
+                AssetInput::new(
+                    Arc::<[u8]>::from(source),
+                    image_media_type(&in_path),
+                    AssetMetadata {
+                        width: Some(decoded.width()),
+                        height: Some(decoded.height()),
+                        attributes: BTreeMap::new(),
+                    },
+                ),
+            )?;
+            page = Some(id);
+            Ok(())
+        })?;
+        session.commit(patch).await?;
+        let page = page.expect("page ID is assigned by the edit");
+
+        let snapshot = session.snapshot();
+        let mut committer = SessionCommitter(&mut session);
+        pipeline
+            .execute(
+                snapshot,
+                Request {
+                    operation: Operation::Full,
+                    scope: Scope::Pages(vec![page]),
+                    ..Request::default()
+                },
+                &mut committer,
+            )
+            .await?;
+
+        let snapshot = session.snapshot();
+        let frame = renderer.render(&snapshot, page).await?;
+        let raster = rasterizer.rasterize(&frame.raster_frame()?, RasterOptions::default())?;
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        raster
+            .image
+            .save(&out_path)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+
+        eprintln!(
+            "[{}/{}] Processed: {} in {:.2}s",
+            idx + 1,
+            total,
+            out_path.display(),
+            file_start.elapsed().as_secs_f64()
+        );
+    }
+
+    eprintln!("[OK] All items processed successfully.");
     Ok(())
+}
+
+fn is_image(path: &Path) -> bool {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png" | "jpg" | "jpeg" | "webp") => true,
+        _ => false,
+    }
 }
 
 async fn initialize_with_retry() {
