@@ -45,3 +45,7 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 toml = { workspace = true }
+
+[[bin]]
+name = "koharu-cli"
+path = "src/bin/run.rs"
